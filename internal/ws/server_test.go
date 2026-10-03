@@ -17,7 +17,7 @@ func decodeMessage(t *testing.T, data []byte) map[string]any {
 
 func TestReconnectMarksRetainedStatusCachedWithoutChangingIdentity(t *testing.T) {
 	hub := NewHub()
-	hub.BroadcastStatus(RadioStatusMsg{Type: "radio_status", Frequency: 14042300, Mode: "USB", Radio: "RGO One", Timestamp: 1000, SessionID: "session-a", Sequence: 7})
+	hub.BroadcastStatus(RadioStatusMsg{Type: "radio_status", Frequency: 14042300, Mode: "USB", Radio: "RGO One", Timestamp: 1000, Protocol: "shackcq.radio-observation.v1", SessionID: "session-a", Sequence: 7})
 
 	client := &client{send: make(chan []byte, 4)}
 	hub.add(client)
@@ -59,12 +59,17 @@ func TestFailureEvidenceIsTransientAndNeverReplayedAsObservation(t *testing.T) {
 }
 
 type referenceDualPathCursor struct {
-	seen      map[string]uint8
-	watermark map[string]uint64
+	seen          map[string]uint8
+	watermark     map[string]uint64
+	activeSession string
+	retired       map[string]bool
 }
 
 func (c *referenceDualPathCursor) offer(path, session string, sequence uint64, observed, cached bool) bool {
-	if !observed || cached || session == "" || sequence == 0 || sequence <= c.watermark[session] {
+	if c.retired == nil {
+		c.retired = map[string]bool{}
+	}
+	if !observed || cached || session == "" || sequence == 0 || sequence <= c.watermark[session] || c.retired[session] {
 		return false
 	}
 	key := fmt.Sprintf("%s:%d", session, sequence)
@@ -79,6 +84,10 @@ func (c *referenceDualPathCursor) offer(path, session string, sequence uint64, o
 		return false
 	}
 	c.watermark[session] = sequence
+	if c.activeSession != "" && c.activeSession != session {
+		c.retired[c.activeSession] = true
+	}
+	c.activeSession = session
 	return true
 }
 
@@ -111,5 +120,21 @@ func TestReferenceDualPathAcceptanceRejectsReplayReorderingAndDeliveryLoss(t *te
 	}
 	if cursor.offer("local", "session-b", 2, false, false) || cursor.offer("server", "session-b", 2, false, false) {
 		t.Fatal("failed poll advanced freshness")
+	}
+}
+
+func TestReferenceDualPathAcceptanceRejectsDelayedRetiredSession(t *testing.T) {
+	cursor := referenceDualPathCursor{seen: map[string]uint8{}, watermark: map[string]uint64{}}
+	if cursor.offer("local", "session-a", 7, true, false) || !cursor.offer("server", "session-a", 7, true, false) {
+		t.Fatal("initial session was not accepted")
+	}
+	if cursor.offer("local", "session-a", 8, true, false) {
+		t.Fatal("one-path observation advanced freshness")
+	}
+	if cursor.offer("local", "session-b", 1, true, false) || !cursor.offer("server", "session-b", 1, true, false) {
+		t.Fatal("replacement session was not accepted")
+	}
+	if cursor.offer("server", "session-a", 8, true, false) {
+		t.Fatal("delayed evidence from a retired session advanced freshness")
 	}
 }

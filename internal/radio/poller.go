@@ -12,7 +12,15 @@ import (
 	"waveloggate/internal/wavelog"
 )
 
-const observationReportInterval = 5 * time.Second
+const legacyReportInterval = 30 * time.Minute
+const maxSafeObservationSequence = uint64(9_007_199_254_740_991)
+
+type radioDelivery struct {
+	data       wavelog.RadioData
+	event      PollEvent
+	profile    *config.Profile
+	generation uint64
+}
 
 // Poller polls a RadioClient every second and reports changes.
 type Poller struct {
@@ -26,10 +34,16 @@ type Poller struct {
 	lastFailureReport time.Time
 	failed            bool
 	sessionID         string
+	sessionStartedAt  time.Time
 	sequence          uint64
 	reportInterval    time.Duration
+	correlated        bool
+	delivery          chan radioDelivery
+	profileGeneration uint64
+	deliveryCancel    context.CancelFunc
 	now               func() time.Time
 	cancel            context.CancelFunc
+	wg                sync.WaitGroup
 }
 
 // NewPoller creates a Poller. Successful unchanged reads are reported at a
@@ -37,12 +51,27 @@ type Poller struct {
 // cached transport state.
 func NewPoller(cfg *config.Profile, wlClient *wavelog.Client, onPoll PollCallback) *Poller {
 	return &Poller{
-		cfg:            cfg,
-		wlClient:       wlClient,
-		onPoll:         onPoll,
-		sessionID:      newSessionID(),
-		reportInterval: observationReportInterval,
-		now:            time.Now,
+		cfg:               cfg,
+		wlClient:          wlClient,
+		onPoll:            onPoll,
+		sessionID:         newSessionID(),
+		sessionStartedAt:  time.Now().UTC().Truncate(time.Millisecond),
+		reportInterval:    legacyReportInterval,
+		delivery:          make(chan radioDelivery, 1),
+		profileGeneration: 1,
+		now:               time.Now,
+	}
+}
+
+// ConfigureObservationCapability enables correlated heartbeat reporting only
+// after an exact server capability was negotiated. nil restores v2.1.1 cadence.
+func (p *Poller) ConfigureObservationCapability(capability *wavelog.RadioObservationOffer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.correlated = capability != nil
+	p.reportInterval = legacyReportInterval
+	if capability != nil {
+		p.reportInterval = time.Duration(capability.ReportIntervalMS) * time.Millisecond
 	}
 }
 
@@ -50,8 +79,28 @@ func NewPoller(cfg *config.Profile, wlClient *wavelog.Client, onPoll PollCallbac
 func (p *Poller) UpdateConfig(cfg *config.Profile) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.profileGeneration++
+	if p.deliveryCancel != nil {
+		p.deliveryCancel()
+		p.deliveryCancel = nil
+	}
+	for len(p.delivery) > 0 {
+		<-p.delivery
+	}
 	p.cfg = cfg
 	p.client = buildClient(cfg)
+	if p.wlClient != nil {
+		p.wlClient.UpdateProfile(cfg)
+	}
+	p.sessionID = newSessionID()
+	p.sessionStartedAt = p.now().UTC().Truncate(time.Millisecond)
+	p.sequence = 0
+	p.lastStatus = RigStatus{}
+	p.lastReport = time.Time{}
+	p.lastFailureReport = time.Time{}
+	p.failed = false
+	p.correlated = false
+	p.reportInterval = legacyReportInterval
 }
 
 // Start begins polling in a background goroutine.
@@ -62,8 +111,12 @@ func (p *Poller) Start(ctx context.Context) {
 
 	ctx, cancel := context.WithCancel(ctx)
 	p.cancel = cancel
+	p.wg.Add(1)
+	go p.deliveryLoop(ctx)
 
+	p.wg.Add(1)
 	go func() {
+		defer p.wg.Done()
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -82,6 +135,7 @@ func (p *Poller) Stop() {
 	if p.cancel != nil {
 		p.cancel()
 	}
+	p.wg.Wait()
 }
 
 // SetFreqMode issues a QSY command through the current radio client.
@@ -142,34 +196,47 @@ func (p *Poller) poll() {
 	p.mu.Lock()
 	client := p.client
 	cfg := p.cfg
-	sessionID := p.sessionID
-	p.mu.Unlock()
-
 	if client == nil {
+		p.mu.Unlock()
 		return
 	}
-
-	p.mu.Lock()
+	if p.sequence >= maxSafeObservationSequence {
+		p.sessionID = newSessionID()
+		p.sessionStartedAt = p.now().UTC().Truncate(time.Millisecond)
+		p.sequence = 0
+	}
 	p.sequence++
+	sessionID := p.sessionID
+	sessionStartedAt := p.sessionStartedAt
 	sequence := p.sequence
+	correlated := p.correlated
+	generation := p.profileGeneration
+	radioName := ""
+	if cfg != nil {
+		radioName = cfg.WavelogRadioname
+	}
 	p.mu.Unlock()
 
 	status, err := client.GetStatus()
 	if err != nil {
-		now := p.now()
+		now := p.now().UTC().Truncate(time.Millisecond)
 		p.mu.Lock()
+		if generation != p.profileGeneration || sessionID != p.sessionID {
+			p.mu.Unlock()
+			return
+		}
 		report := !p.failed || p.lastFailureReport.IsZero() || now.Sub(p.lastFailureReport) >= p.reportInterval
 		p.failed = true
 		if report {
 			p.lastFailureReport = now
 		}
 		p.mu.Unlock()
-		if report && p.onPoll != nil {
-			p.onPoll(PollEvent{State: PollFailed, SessionID: sessionID, Sequence: sequence, EventAt: now, FailureCode: "RADIO_POLL_FAILED"})
+		if report && p.onPoll != nil && correlated {
+			p.onPoll(PollEvent{State: PollFailed, SessionID: sessionID, SessionStartedAt: sessionStartedAt, Sequence: sequence, EventAt: now, FailureCode: "RADIO_POLL_FAILED", Correlated: true})
 		}
 		return
 	}
-	now := p.now()
+	now := p.now().UTC().Truncate(time.Millisecond)
 
 	// Optionally zero out power. HamlibClient already skips the RFPOWER read
 	// when this is set; this is the backstop that also covers FLRig, which
@@ -189,6 +256,10 @@ func (p *Poller) poll() {
 	}
 
 	p.mu.Lock()
+	if generation != p.profileGeneration || sessionID != p.sessionID {
+		p.mu.Unlock()
+		return
+	}
 	changed := !statusEqual(status, p.lastStatus)
 	recovered := p.failed
 	reportDue := p.lastReport.IsZero() || now.Sub(p.lastReport) >= p.reportInterval
@@ -198,7 +269,7 @@ func (p *Poller) poll() {
 		p.lastReport = now
 		p.mu.Unlock()
 
-		event := PollEvent{State: PollObserved, Status: status, SessionID: sessionID, Sequence: sequence, ObservedAt: now, EventAt: now}
+		event := PollEvent{State: PollObserved, Status: status, RadioName: radioName, SessionID: sessionID, SessionStartedAt: sessionStartedAt, Sequence: sequence, ObservedAt: now, EventAt: now, Correlated: correlated}
 		if p.onPoll != nil {
 			p.onPoll(event)
 		}
@@ -206,13 +277,17 @@ func (p *Poller) poll() {
 		// Send to Wavelog.
 		if p.wlClient != nil {
 			data := wavelog.RadioData{
-				Frequency:        int64(math.Round(status.FreqA)),
-				Mode:             status.Mode,
-				Power:            status.Power,
-				Split:            status.Split,
-				SourceSessionID:  sessionID,
-				SourceSequence:   sequence,
-				SourceObservedAt: now,
+				Frequency: int64(math.Round(status.FreqA)),
+				Mode:      status.Mode,
+				Power:     status.Power,
+				Split:     status.Split,
+			}
+			if correlated {
+				data.SourceProtocol = wavelog.RadioObservationProtocol
+				data.SourceSessionID = sessionID
+				data.SourceSessionStartedAt = sessionStartedAt
+				data.SourceSequence = sequence
+				data.SourceObservedAt = now
 			}
 			if status.Split {
 				data.FrequencyRx = int64(math.Round(status.FreqB))
@@ -223,16 +298,77 @@ func (p *Poller) poll() {
 				data.SatName = cfg.SatName
 				data.SatMode = cfg.SatMode
 			}
-			if err := p.wlClient.UpdateRadioStatus(data); err != nil {
-				if p.onPoll != nil {
-					p.onPoll(PollEvent{State: ServerDeliveryFailed, Status: status, SessionID: sessionID, Sequence: sequence, ObservedAt: now, EventAt: p.now(), FailureCode: "SERVER_DELIVERY_FAILED"})
-				}
-			} else if p.onPoll != nil {
-				p.onPoll(PollEvent{State: ServerDelivered, Status: status, SessionID: sessionID, Sequence: sequence, ObservedAt: now, EventAt: p.now()})
+			if correlated {
+				p.enqueueDelivery(radioDelivery{data: data, event: event, profile: cfg, generation: generation})
+			} else {
+				_ = p.wlClient.UpdateRadioStatusForProfile(data, cfg)
 			}
 		}
 	} else {
 		p.mu.Unlock()
+	}
+}
+
+func (p *Poller) enqueueDelivery(next radioDelivery) {
+	select {
+	case p.delivery <- next:
+		return
+	default:
+	}
+	select {
+	case dropped := <-p.delivery:
+		if p.onPoll != nil {
+			dropped.event.State = ServerDeliveryFailed
+			dropped.event.EventAt = p.now()
+			dropped.event.FailureCode = "SERVER_DELIVERY_COALESCED"
+			p.onPoll(dropped.event)
+		}
+	default:
+	}
+	select {
+	case p.delivery <- next:
+	default:
+	}
+}
+
+func (p *Poller) deliveryLoop(ctx context.Context) {
+	defer p.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case delivery := <-p.delivery:
+			p.mu.Lock()
+			if delivery.generation != p.profileGeneration {
+				p.mu.Unlock()
+				continue
+			}
+			requestContext, cancel := context.WithCancel(ctx)
+			p.deliveryCancel = cancel
+			p.mu.Unlock()
+
+			err := p.wlClient.UpdateRadioObservationForProfile(requestContext, delivery.data, delivery.profile)
+			cancel()
+			p.mu.Lock()
+			stale := delivery.generation != p.profileGeneration
+			if !stale {
+				p.deliveryCancel = nil
+			}
+			p.mu.Unlock()
+			if stale {
+				continue
+			}
+			delivery.event.EventAt = p.now()
+			if err != nil {
+				delivery.event.State = ServerDeliveryFailed
+				delivery.event.FailureCode = "SERVER_DELIVERY_FAILED"
+			} else {
+				delivery.event.State = ServerDelivered
+			}
+			if p.onPoll != nil {
+				p.onPoll(delivery.event)
+			}
+		}
 	}
 }
 

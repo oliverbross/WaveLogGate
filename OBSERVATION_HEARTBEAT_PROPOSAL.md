@@ -1,96 +1,113 @@
-# Radio observation heartbeat proposal
+# Correlated radio-observation heartbeat proposal
 
 Reference baseline: official WaveLogGate v2.1.1, commit `9344a4852ad461b60a50fbb384e2afdf17f6e414`.
+
+Status: isolated reference candidate for upstream review. It is not an official release and must not be used to relax a production command gate until the protocol and all consumers are accepted and released.
 
 ## Problem statement
 
 > Official WaveLogGate v2.1.1 does not continuously export successful unchanged radio polls. ShackCQ’s current 15-second dual-path pre-command policy therefore prevents reliable idle-radio control.
 
-The current poller reads the configured controller every second, but publishes only a changed state or a forced update after 30 minutes. The WebSocket hub replays its retained status to a new browser with a newly generated timestamp. Those behaviours make four distinct facts look alike:
+The v2.1.1 poller reads the configured controller every second, but exports only a changed state or a forced update after 30 minutes. `BroadcastStatus` timestamps and retains the bytes of a newly broadcast status; `Hub.add` sends those retained bytes unchanged to a new WebSocket client. The replay does not generate a replacement timestamp. The limitation is sparse successful-observation reporting plus the absence of explicit replay and cross-path correlation metadata.
+
+The protocol must keep four facts distinct:
 
 1. a successful radio observation;
-2. replay of a cached status;
-3. connectivity to the local gateway transport;
-4. a failed radio poll.
+2. replay of cached status;
+3. gateway transport connectivity;
+4. a failed radio poll or failed server delivery.
 
-An old exported observation does not, by itself, show that the physical radio is disconnected. It only shows that no recent successful observation has been exported.
+An old exported observation does not establish that the physical radio is disconnected. It establishes only that no recent successful observation has been exported.
 
-## Proposed client protocol
+## Capability negotiation and compatibility
 
-Keep the one-second controller poll. Export a successful observation immediately on first read, state change, recovery after a failed poll, and at a bounded five-second cadence while the radio remains unchanged.
+The candidate discovers an additive, versioned capability through the existing authenticated v2 token-information request:
 
-Every client process creates a random `session_id`. Every actual controller poll attempt increments a `sequence` within that session. Successful observations carry:
+```json
+{
+  "extensions": {
+    "shackcq.radio-observation.v1": {
+      "version": 1,
+      "report_interval_ms": 5000,
+      "acknowledgement": "echo",
+      "max_clock_skew_ms": 300000
+    }
+  }
+}
+```
+
+The extension is enabled only when the exact name, version, acknowledgement mode and bounded timing values are present. A v2 key alone is not capability evidence. An absent extension keeps the existing 30-minute unchanged-state cadence. An unsupported or malformed offer fails closed. A profile, controller, credential or station change creates a new client session and disables the extension until it is negotiated again.
+
+This preserves these combinations:
+
+- unmodified client and existing server: unchanged;
+- candidate client and legacy v1 server: legacy payload and cadence;
+- candidate client and v2 server without the extension: legacy cadence and no extension fields;
+- candidate client and extension-enabled ShackCQ endpoint: correlated heartbeat and exact acknowledgement.
+
+## Successful observation identity
+
+The controller remains single-owner and is polled once per second. A successful observation is exported on the first read, state change, recovery after failure, and the negotiated unchanged-state interval.
+
+Each client session has a random `session_id`, a millisecond UTC `session_started_at`, and a sequence counter incremented for every controller poll attempt. Sequence values are positive JSON-safe integers and rotate into a new session before exceeding `9007199254740991`. Successful observations carry the same identity and source time over WSS and HTTPS:
 
 ```json
 {
   "type": "radio_status",
   "frequency": 14042300,
   "mode": "USB",
-  "timestamp": 1790995800000,
+  "timestamp": 1790995800123,
+  "observation_protocol": "shackcq.radio-observation.v1",
   "session_id": "4c7701b6b7994e388c34d1c0bff455a9",
+  "session_started_at": 1790995700123,
   "sequence": 42
 }
 ```
 
-`timestamp` is the time of the successful controller read. Socket activity, welcome frames, failed polls, and delivery attempts cannot set it.
+`timestamp` is the successful controller-read time, truncated to UTC milliseconds. HTTP uses the equivalent fixed millisecond ISO-8601 form. Clock rollback within a session, source time more than five seconds ahead of browser receipt, and server source time outside the negotiated five-minute skew bound are rejected. Split operation normalizes the receive VFO and mode in the consumer; existing satellite and transverter offsets remain applied before export.
 
-On browser connection, the hub may replay the last observation only with `cached: true`, preserving the original timestamp, session and sequence. A replay helps render last-known state but never refreshes readiness.
-
-Poll and server-delivery results are separate, transient evidence:
-
-```json
-{"type":"radio_poll_status","state":"poll_failed","session_id":"...","sequence":43,"timestamp":1790995801000,"failure_code":"RADIO_POLL_FAILED"}
-{"type":"radio_delivery_status","state":"server_delivered","session_id":"...","sequence":44,"timestamp":1790995802000,"observed_at":1790995802000}
-```
-
-A poll failure has no `observed_at`. The first failure is emitted immediately; repeated failures are rate-limited to the observation cadence. Recovery is a new successful observation even when frequency and mode are unchanged.
+On WebSocket connection the hub may replay the retained observation with `cached:true`, preserving its original identity, source time and payload. Welcome frames, socket traffic and cached replay never create a successful observation.
 
 ## Credential-bound server path
 
-The same successful observation is posted through the existing v2 radio endpoint with additive fields:
+The v2 radio request adds `source_protocol`, `source_session_id`, `source_session_started_at`, `source_sequence`, and `source_observed_at`. The ShackCQ compatibility endpoint binds the report to the authenticated credential, tenant, station profile and radio name. It stores one current-state row per credential and accepts only:
 
-- `source_session_id`
-- `source_sequence`
-- `source_observed_at`
+- a session with a later authenticated `session_started_at`; or
+- a higher sequence in the current session.
 
-The server must store those values with its credential/station binding and its own `received_at`. A status read used by ShackCQ must return them without replacing `source_observed_at` with cache or request time. The client reports `server_delivered` only after a 2xx response and `server_delivery_failed` after transport or non-2xx failure.
+An exact duplicate is idempotently acknowledged. A different payload under the same identity, a retired session, a lower sequence, an invalid time, or a mismatched binding is rejected. The response echoes the protocol, identity, times and a canonical SHA-256 payload hash. An unrelated 2xx, ignored metadata, authentication error, rate limit or server error is a delivery failure.
 
-The legacy v1 request body remains byte-shape compatible and carries none of these fields. For v2, the fields are additive. A server that has not implemented this capability may ignore them, but it cannot provide dual-path freshness; ShackCQ must remain fail-closed until the credential-bound response echoes the identity. If a strict v2 implementation rejects unknown fields, capability negotiation must precede enabling the extension for that server.
+Opaque random session IDs provide correlation only. Current-session ownership comes from the credential-bound server transition ordered by `session_started_at`; the browser accepts that session only after the local live half matches the server’s current authenticated half. Once a replacement session is accepted, earlier sessions are retired and delayed evidence cannot reinstate them.
 
-## Consumer rules
+## Poll and delivery behavior
 
-Local and server evidence is the same observation only when station/credential binding, `session_id`, `sequence`, frequency and mode match. The consumer must apply these rules:
+Poll and server-delivery results are transient evidence:
 
-- Accept only a successful, non-cached local observation and a credential-bound server observation with the same identity and state.
-- Maintain a per-session sequence watermark. Ignore `sequence <= watermark` so delayed or reordered reports cannot refresh readiness.
-- Treat a new session as a client restart. Accept it only after both paths agree on the new session and observation.
-- Never advance freshness from `welcome`, socket open/close, cached replay, `poll_failed`, `server_delivered`, or `server_delivery_failed` alone.
-- If local WSS delivery fails, the browser does not receive the local half and cannot satisfy the dual-path gate even if the server succeeds.
-- If server delivery fails, the local half can update last-known display but cannot satisfy the dual-path gate.
-- Browser reconnect first renders any cached observation as last-known. A later live unchanged observation can recover readiness when its matching server observation arrives.
+```json
+{"type":"radio_poll_status","state":"poll_failed","session_id":"...","sequence":43,"timestamp":1790995801000,"failure_code":"RADIO_POLL_FAILED"}
+{"type":"radio_delivery_status","state":"server_delivery_failed","session_id":"...","sequence":44,"timestamp":1790995802000,"observed_at":1790995801500,"failure_code":"SERVER_DELIVERY_FAILED"}
+```
 
-These rules make missing, delayed and independently failed paths fail closed without declaring the radio physically disconnected.
+A failed poll has no successful observation time. A newer known poll or delivery failure invalidates command readiness until a later successful observation is accepted on both paths. Recovery at unchanged frequency and mode is a new observation.
 
-## Cadence and load
+HTTP delivery runs in one cancellable worker with a capacity-one latest-value queue. Slow or hung HTTP therefore cannot block one-second controller polling, create a goroutine per report or grow an unbounded queue. Superseded queued delivery is reported as failed. Shutdown cancels in-flight delivery and waits for both polling and delivery workers.
 
-A five-second observation interval gives a 15-second policy up to two missed heartbeat opportunities. It changes the unchanged-radio upper bound from two updates per hour to 12 per minute, or 720 per hour per connected client, on both local WSS and the v2 radio endpoint. At roughly a few hundred bytes per update, bandwidth is modest, but request count and database writes are material at fleet scale.
+## Browser acceptance rules
 
-Before release, the server should benchmark expected concurrent stations, avoid writing an unchanged full status row when an indexed observation record or last-value upsert is sufficient, and apply small per-client jitter to spread bursts. The cadence should be a negotiated capability with a server-advertised minimum; it must remain comfortably below the website freshness limit. Increasing the website timeout solely to conceal sparse reports is not part of this proposal.
+The browser reducer binds credential, tenant station and radio profile, and tracks its local WSS connection generation. It accepts freshness only when a successful non-cached local observation and the credential-bound server observation have identical protocol, session, sequence, source time and normalized receive state.
 
-## Reference implementation and tests
+It rejects cached frames, transport activity, acknowledgements, failures, reordered or conflicting duplicates, retired sessions, stale connection generations, wrong bindings, future time, clock rollback and values outside JSON-safe limits. A newer one-path observation or known failure clears older readiness. Pending halves expire after 60 seconds and are bounded to 64 entries. Browser reconnect clears authority from the previous connection even when retained frames or unmatched halves remain.
 
-The accompanying patch changes only the official client source and tests. It does not alter radio commands. It provides:
+The two paths corroborate delivery and credential binding of one controller poll. They are not independent physical measurements.
 
-- bounded unchanged successful observations;
-- immediate failure and same-state recovery evidence;
-- process session and poll sequence identity;
-- cache-marked WebSocket replay;
-- distinct server-delivery results and non-2xx handling;
-- additive v2 payload metadata with unchanged v1 payload shape;
-- a reference dual-path consumer test covering replay, reordering, browser reconnect, client restart, and loss on either delivery path.
+## Cadence and capacity
 
-The server storage/API extension and ShackCQ consumer changes are required before production can use the new evidence. This reference patch must not be installed as a private client build or used to relax the current production command gate.
+The proposed five-second interval gives a 15-second consumer policy two missed report opportunities. It changes an opted-in connected client from about two unchanged reports per hour to 12 per minute. The isolated benchmark must report station count, accepted requests per second, PostgreSQL WAL bytes, process CPU/RSS, one-row current-state write behavior, pending-buffer bounds and outage recovery. Loopback synthetic throughput is not production capacity proof. A production rollout should add modest client jitter and validate the expected fleet against the deployed rate limiter and database.
 
-## Separate ShackCQ policy decision
+## Separate policy decision
 
-An alternative policy could send an explicitly approved receive-only command first and then require fresh matching dual-path confirmation before showing success, with a freshly captured restoration target and concurrent-operator protection. That is a command-then-confirm policy, not observation evidence. It changes the safety model and creates activity merely to establish liveness. It is documented here only as a separate product decision and is not implemented or approved by this proposal.
+ShackCQ could separately choose an explicit receive-command-then-confirm policy: capture current state, send an owner-approved receive-only command, then require fresh matching readback and protect restoration from concurrent operator changes. That changes the safety model and manufactures activity to establish liveness. It is not implemented or approved by this proposal.
+
+## Release boundary
+
+This candidate changes no transmit, PTT, Tune, audio, power, antenna, rotator or QSO path. Passing isolated tests establishes a reviewable client/API/browser design. Official upstream acceptance and release, ShackCQ production migration and activation, and real operating acceptance remain separate decisions.

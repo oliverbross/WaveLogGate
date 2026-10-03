@@ -23,13 +23,16 @@ const (
 // Sequence is monotonic within SessionID and advances for every attempt, so a
 // recovery at an unchanged frequency remains distinguishable from cached data.
 type PollEvent struct {
-	State       PollEventState
-	Status      RigStatus
-	SessionID   string
-	Sequence    uint64
-	ObservedAt  time.Time
-	EventAt     time.Time
-	FailureCode string
+	State            PollEventState
+	Status           RigStatus
+	RadioName        string
+	SessionID        string
+	SessionStartedAt time.Time
+	Sequence         uint64
+	ObservedAt       time.Time
+	EventAt          time.Time
+	FailureCode      string
+	Correlated       bool
 }
 
 // PollCallback receives bounded evidence about poll and delivery outcomes.

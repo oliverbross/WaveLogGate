@@ -16,29 +16,32 @@ var upgrader = websocket.Upgrader{
 
 // RadioStatusMsg is the message broadcast to WebSocket clients.
 type RadioStatusMsg struct {
-	Type        string  `json:"type"`
-	Frequency   int64   `json:"frequency"`
-	Mode        string  `json:"mode"`
-	Power       float64 `json:"power,omitempty"`
-	Radio       string  `json:"radio"`
-	Timestamp   int64   `json:"timestamp"`
-	FrequencyRx int64   `json:"frequency_rx,omitempty"`
-	ModeRx      string  `json:"mode_rx,omitempty"`
-	SessionID   string  `json:"session_id,omitempty"`
-	Sequence    uint64  `json:"sequence,omitempty"`
-	Cached      bool    `json:"cached,omitempty"`
+	Type             string  `json:"type"`
+	Frequency        int64   `json:"frequency"`
+	Mode             string  `json:"mode"`
+	Power            float64 `json:"power,omitempty"`
+	Radio            string  `json:"radio"`
+	Timestamp        int64   `json:"timestamp"`
+	FrequencyRx      int64   `json:"frequency_rx,omitempty"`
+	ModeRx           string  `json:"mode_rx,omitempty"`
+	SessionID        string  `json:"session_id,omitempty"`
+	Sequence         uint64  `json:"sequence,omitempty"`
+	Cached           bool    `json:"cached,omitempty"`
+	Protocol         string  `json:"observation_protocol,omitempty"`
+	SessionStartedAt int64   `json:"session_started_at,omitempty"`
 }
 
 // RadioEvidenceMsg reports poll and credential-bound server-delivery state.
 // It never represents a successful radio observation by itself.
 type RadioEvidenceMsg struct {
-	Type        string `json:"type"`
-	State       string `json:"state"`
-	SessionID   string `json:"session_id"`
-	Sequence    uint64 `json:"sequence"`
-	Timestamp   int64  `json:"timestamp"`
-	ObservedAt  int64  `json:"observed_at,omitempty"`
-	FailureCode string `json:"failure_code,omitempty"`
+	Type             string `json:"type"`
+	State            string `json:"state"`
+	SessionID        string `json:"session_id"`
+	SessionStartedAt int64  `json:"session_started_at,omitempty"`
+	Sequence         uint64 `json:"sequence"`
+	Timestamp        int64  `json:"timestamp"`
+	ObservedAt       int64  `json:"observed_at,omitempty"`
+	FailureCode      string `json:"failure_code,omitempty"`
 }
 
 type client struct {
@@ -132,7 +135,9 @@ func (h *Hub) add(c *client) {
 
 	// Send current status if available.
 	if current != nil {
-		current.Cached = true
+		if current.Protocol != "" {
+			current.Cached = true
+		}
 		if data, err := json.Marshal(current); err == nil {
 			c.send <- data
 		}
