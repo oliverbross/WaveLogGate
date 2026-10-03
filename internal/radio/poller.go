@@ -12,27 +12,37 @@ import (
 	"waveloggate/internal/wavelog"
 )
 
-// StatusCallback is called whenever radio status changes or needs reporting.
-type StatusCallback func(status RigStatus)
+const observationReportInterval = 5 * time.Second
 
 // Poller polls a RadioClient every second and reports changes.
 type Poller struct {
-	mu          sync.Mutex
-	client      RadioClient
-	cfg         *config.Profile
-	wlClient    *wavelog.Client
-	onStatus    StatusCallback
-	lastStatus  RigStatus
-	lastUpdated time.Time
-	cancel      context.CancelFunc
+	mu                sync.Mutex
+	client            RadioClient
+	cfg               *config.Profile
+	wlClient          *wavelog.Client
+	onPoll            PollCallback
+	lastStatus        RigStatus
+	lastReport        time.Time
+	lastFailureReport time.Time
+	failed            bool
+	sessionID         string
+	sequence          uint64
+	reportInterval    time.Duration
+	now               func() time.Time
+	cancel            context.CancelFunc
 }
 
-// NewPoller creates a Poller. onStatus is called whenever status changes (or 30 min force update).
-func NewPoller(cfg *config.Profile, wlClient *wavelog.Client, onStatus StatusCallback) *Poller {
+// NewPoller creates a Poller. Successful unchanged reads are reported at a
+// bounded cadence so consumers can distinguish observation freshness from
+// cached transport state.
+func NewPoller(cfg *config.Profile, wlClient *wavelog.Client, onPoll PollCallback) *Poller {
 	return &Poller{
-		cfg:      cfg,
-		wlClient: wlClient,
-		onStatus: onStatus,
+		cfg:            cfg,
+		wlClient:       wlClient,
+		onPoll:         onPoll,
+		sessionID:      newSessionID(),
+		reportInterval: observationReportInterval,
+		now:            time.Now,
 	}
 }
 
@@ -132,21 +142,39 @@ func (p *Poller) poll() {
 	p.mu.Lock()
 	client := p.client
 	cfg := p.cfg
+	sessionID := p.sessionID
 	p.mu.Unlock()
 
 	if client == nil {
 		return
 	}
 
+	p.mu.Lock()
+	p.sequence++
+	sequence := p.sequence
+	p.mu.Unlock()
+
 	status, err := client.GetStatus()
 	if err != nil {
+		now := p.now()
+		p.mu.Lock()
+		report := !p.failed || p.lastFailureReport.IsZero() || now.Sub(p.lastFailureReport) >= p.reportInterval
+		p.failed = true
+		if report {
+			p.lastFailureReport = now
+		}
+		p.mu.Unlock()
+		if report && p.onPoll != nil {
+			p.onPoll(PollEvent{State: PollFailed, SessionID: sessionID, Sequence: sequence, EventAt: now, FailureCode: "RADIO_POLL_FAILED"})
+		}
 		return
 	}
+	now := p.now()
 
 	// Optionally zero out power. HamlibClient already skips the RFPOWER read
 	// when this is set; this is the backstop that also covers FLRig, which
 	// reports power unconditionally.
-	if cfg.IgnorePwr {
+	if cfg != nil && cfg.IgnorePwr {
 		status.Power = 0
 	}
 
@@ -156,38 +184,52 @@ func (p *Poller) poll() {
 	}
 
 	// Apply satellite/transverter frequency offsets.
-	ApplySatOffsets(&status, cfg)
+	if cfg != nil {
+		ApplySatOffsets(&status, cfg)
+	}
 
 	p.mu.Lock()
 	changed := !statusEqual(status, p.lastStatus)
-	forceUpdate := time.Since(p.lastUpdated) > 30*time.Minute
-	if changed || forceUpdate {
+	recovered := p.failed
+	reportDue := p.lastReport.IsZero() || now.Sub(p.lastReport) >= p.reportInterval
+	p.failed = false
+	if changed || recovered || reportDue {
 		p.lastStatus = status
-		p.lastUpdated = time.Now()
+		p.lastReport = now
 		p.mu.Unlock()
 
-		if p.onStatus != nil {
-			p.onStatus(status)
+		event := PollEvent{State: PollObserved, Status: status, SessionID: sessionID, Sequence: sequence, ObservedAt: now, EventAt: now}
+		if p.onPoll != nil {
+			p.onPoll(event)
 		}
 
 		// Send to Wavelog.
 		if p.wlClient != nil {
 			data := wavelog.RadioData{
-				Frequency: int64(math.Round(status.FreqA)),
-				Mode:      status.Mode,
-				Power:     status.Power,
-				Split:     status.Split,
+				Frequency:        int64(math.Round(status.FreqA)),
+				Mode:             status.Mode,
+				Power:            status.Power,
+				Split:            status.Split,
+				SourceSessionID:  sessionID,
+				SourceSequence:   sequence,
+				SourceObservedAt: now,
 			}
 			if status.Split {
 				data.FrequencyRx = int64(math.Round(status.FreqB))
 				data.ModeRx = status.ModeB
 			}
-			if cfg.SatEnabled {
+			if cfg != nil && cfg.SatEnabled {
 				data.PropMode = "SAT"
 				data.SatName = cfg.SatName
 				data.SatMode = cfg.SatMode
 			}
-			_ = p.wlClient.UpdateRadioStatus(data)
+			if err := p.wlClient.UpdateRadioStatus(data); err != nil {
+				if p.onPoll != nil {
+					p.onPoll(PollEvent{State: ServerDeliveryFailed, Status: status, SessionID: sessionID, Sequence: sequence, ObservedAt: now, EventAt: p.now(), FailureCode: "SERVER_DELIVERY_FAILED"})
+				}
+			} else if p.onPoll != nil {
+				p.onPoll(PollEvent{State: ServerDelivered, Status: status, SessionID: sessionID, Sequence: sequence, ObservedAt: now, EventAt: p.now()})
+			}
 		}
 	} else {
 		p.mu.Unlock()

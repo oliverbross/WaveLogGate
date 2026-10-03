@@ -322,11 +322,13 @@ Any client can connect to `ws://localhost:54322` to receive live radio status:
   "mode": "USB",
   "power": 100,
   "radio": "WLGate",
-  "timestamp": 1700000000000
+  "timestamp": 1700000000000,
+  "session_id": "4c7701b6b7994e388c34d1c0bff455a9",
+  "sequence": 42
 }
 ```
 
-A `{"type":"welcome","message":"..."}` message is sent on connect, followed immediately by the last known radio status.
+A successful radio observation is sent on first read, state change, recovery after a poll failure, and every five seconds while the radio remains unchanged. A `{"type":"welcome","message":"..."}` message is sent on connect, followed by the last known radio status with `"cached":true`; that replay preserves its original timestamp, session and sequence. Transient `radio_poll_status` and `radio_delivery_status` messages report poll and credential-bound server-delivery outcomes, but do not represent a successful radio observation.
 
 ---
 

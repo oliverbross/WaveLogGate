@@ -124,15 +124,18 @@ func (c *Client) GetTokenInfo() (*TokenInfo, error) {
 
 // RadioData holds the data sent to Wavelog's /api/radio endpoint.
 type RadioData struct {
-	Frequency   int64
-	Mode        string
-	Power       float64
-	FrequencyRx int64
-	ModeRx      string
-	Split       bool
-	PropMode    string
-	SatName     string
-	SatMode     string
+	Frequency        int64
+	Mode             string
+	Power            float64
+	FrequencyRx      int64
+	ModeRx           string
+	Split            bool
+	PropMode         string
+	SatName          string
+	SatMode          string
+	SourceSessionID  string
+	SourceSequence   uint64
+	SourceObservedAt time.Time
 }
 
 // Station represents a Wavelog station profile.
@@ -381,16 +384,19 @@ func (c *Client) SendQSO(adifStr string, dryRun bool) (*QSOResult, error) {
 }
 
 type radioPayload struct {
-	Radio       string  `json:"radio"`
-	Key         string  `json:"key,omitempty"`
-	Frequency   int64   `json:"frequency"`
-	Mode        string  `json:"mode"`
-	Power       float64 `json:"power,omitempty"`
-	FrequencyRx int64   `json:"frequency_rx,omitempty"`
-	ModeRx      string  `json:"mode_rx,omitempty"`
-	PropMode    string  `json:"prop_mode,omitempty"`
-	SatName     string  `json:"sat_name,omitempty"`
-	SatMode     string  `json:"sat_mode,omitempty"`
+	Radio            string  `json:"radio"`
+	Key              string  `json:"key,omitempty"`
+	Frequency        int64   `json:"frequency"`
+	Mode             string  `json:"mode"`
+	Power            float64 `json:"power,omitempty"`
+	FrequencyRx      int64   `json:"frequency_rx,omitempty"`
+	ModeRx           string  `json:"mode_rx,omitempty"`
+	PropMode         string  `json:"prop_mode,omitempty"`
+	SatName          string  `json:"sat_name,omitempty"`
+	SatMode          string  `json:"sat_mode,omitempty"`
+	SourceSessionID  string  `json:"source_session_id,omitempty"`
+	SourceSequence   uint64  `json:"source_sequence,omitempty"`
+	SourceObservedAt string  `json:"source_observed_at,omitempty"`
 }
 
 // UpdateRadioStatus posts radio status to Wavelog's radio endpoint.
@@ -430,6 +436,15 @@ func (c *Client) UpdateRadioStatus(data RadioData) error {
 		SatName:     data.SatName,
 		SatMode:     data.SatMode,
 	}
+	// Observation correlation is an additive v2 extension. Legacy v1 servers
+	// retain their existing payload unchanged.
+	if IsV2Key(cfg.WavelogKey) {
+		p.SourceSessionID = data.SourceSessionID
+		p.SourceSequence = data.SourceSequence
+		if !data.SourceObservedAt.IsZero() {
+			p.SourceObservedAt = data.SourceObservedAt.UTC().Format(time.RFC3339Nano)
+		}
+	}
 	if data.Power > 0 {
 		p.Power = data.Power
 	}
@@ -448,7 +463,11 @@ func (c *Client) UpdateRadioStatus(data RadioData) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("radio status HTTP %d", resp.StatusCode)
+	}
 	return nil
 }
 
